@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Test;
 import stirling.software.common.model.ApplicationProperties;
 import stirling.software.proprietary.security.configuration.ee.KeygenLicenseVerifier.License;
 import stirling.software.proprietary.security.configuration.ee.LicenseKeyChecker;
+import stirling.software.proprietary.service.AuditService;
 import stirling.software.proprietary.storage.provider.LocalStorageProvider;
 import stirling.software.proprietary.storage.provider.StorageProvider;
 import stirling.software.proprietary.storage.repository.FileEncryptionKeyRepository;
@@ -30,7 +31,7 @@ class StorageProviderConfigTest {
     void provider_local_normalLicense_buildsLocalProviderWithoutLicenseCheck() {
         StorageProviderConfig cfg = newConfig("local", License.NORMAL);
 
-        StorageProvider provider = cfg.storageProvider();
+        StorageProvider provider = cfg.storageProvider(cfg.storageEncryptionState());
         assertThat(provider).isInstanceOf(LocalStorageProvider.class);
     }
 
@@ -40,7 +41,7 @@ class StorageProviderConfigTest {
 
         // License check must throw BEFORE S3Clients.build tries to validate endpoint / bucket.
         // Otherwise an empty config would surface as a confusing "bucket must be set" error.
-        assertThatThrownBy(cfg::storageProvider)
+        assertThatThrownBy(() -> cfg.storageProvider(cfg.storageEncryptionState()))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("storage.provider=s3 requires a Pro or Enterprise license");
     }
@@ -49,7 +50,7 @@ class StorageProviderConfigTest {
     void provider_database_normalLicense_throws() {
         StorageProviderConfig cfg = newConfig("database", License.NORMAL);
 
-        assertThatThrownBy(cfg::storageProvider)
+        assertThatThrownBy(() -> cfg.storageProvider(cfg.storageEncryptionState()))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining(
                         "storage.provider=database requires a Pro or Enterprise license");
@@ -58,7 +59,8 @@ class StorageProviderConfigTest {
     @Test
     void provider_database_serverLicense_buildsDatabaseProvider() {
         StorageProviderConfig cfg = newConfig("database", License.SERVER);
-        assertThatCode(cfg::storageProvider).doesNotThrowAnyException();
+        assertThatCode(() -> cfg.storageProvider(cfg.storageEncryptionState()))
+                .doesNotThrowAnyException();
     }
 
     @Test
@@ -67,7 +69,7 @@ class StorageProviderConfigTest {
 
         // Valid license, but no bucket/endpoint configured - so we expect a CONFIG error,
         // not a license error. The error message must not mention the license.
-        assertThatThrownBy(cfg::storageProvider)
+        assertThatThrownBy(() -> cfg.storageProvider(cfg.storageEncryptionState()))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageNotContaining("Pro or Enterprise license");
     }
@@ -76,7 +78,7 @@ class StorageProviderConfigTest {
     void provider_s3_enterpriseLicense_passesLicenseCheck_thenFailsOnEmptyConfig() {
         StorageProviderConfig cfg = newConfig("s3", License.ENTERPRISE);
 
-        assertThatThrownBy(cfg::storageProvider)
+        assertThatThrownBy(() -> cfg.storageProvider(cfg.storageEncryptionState()))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageNotContaining("Pro or Enterprise license");
     }
@@ -85,7 +87,7 @@ class StorageProviderConfigTest {
     void provider_unknown_normalLicense_throwsUnsupportedProvider_notLicense() {
         StorageProviderConfig cfg = newConfig("magic", License.NORMAL);
 
-        assertThatThrownBy(cfg::storageProvider)
+        assertThatThrownBy(() -> cfg.storageProvider(cfg.storageEncryptionState()))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Storage provider not supported: magic")
                 .hasMessageNotContaining("license");
@@ -100,6 +102,7 @@ class StorageProviderConfigTest {
         // count() defaults to 0 under Mockito, so the encryption decorator stays inactive here.
         FileEncryptionKeyRepository keyRepo = mock(FileEncryptionKeyRepository.class);
         LicenseKeyChecker checker = mock(LicenseKeyChecker.class);
+        AuditService auditService = mock(AuditService.class);
         when(checker.getPremiumLicenseEnabledResult()).thenReturn(license);
         if (license == License.SERVER || license == License.ENTERPRISE) {
             doNothing().when(checker).requireProOrEnterprise(anyString());
@@ -114,6 +117,6 @@ class StorageProviderConfigTest {
                     .when(checker)
                     .requireProOrEnterprise(anyString());
         }
-        return new StorageProviderConfig(props, repo, keyRepo, checker);
+        return new StorageProviderConfig(props, repo, keyRepo, checker, auditService);
     }
 }

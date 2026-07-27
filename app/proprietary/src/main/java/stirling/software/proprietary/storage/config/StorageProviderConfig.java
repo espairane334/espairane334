@@ -17,9 +17,13 @@ import stirling.software.common.configuration.InstallationPathConfig;
 import stirling.software.common.model.ApplicationProperties;
 import stirling.software.proprietary.cluster.s3.S3Clients;
 import stirling.software.proprietary.security.configuration.ee.LicenseKeyChecker;
+import stirling.software.proprietary.service.AuditService;
+import stirling.software.proprietary.storage.crypto.AuditingStorageEncryptionListener;
 import stirling.software.proprietary.storage.crypto.EncryptingStorageProvider;
 import stirling.software.proprietary.storage.crypto.FileEncryptionKeyService;
 import stirling.software.proprietary.storage.crypto.FileEncryptionMasterKey;
+import stirling.software.proprietary.storage.crypto.StorageEncryptionAuditListener;
+import stirling.software.proprietary.storage.crypto.StorageEncryptionState;
 import stirling.software.proprietary.storage.provider.DatabaseStorageProvider;
 import stirling.software.proprietary.storage.provider.LocalStorageProvider;
 import stirling.software.proprietary.storage.provider.S3StorageProvider;
@@ -36,43 +40,72 @@ public class StorageProviderConfig {
     private final StoredFileBlobRepository storedFileBlobRepository;
     private final FileEncryptionKeyRepository fileEncryptionKeyRepository;
     private final LicenseKeyChecker licenseKeyChecker;
+    private final AuditService auditService;
 
     @Value("${stirling.security.fileEncryptionKey:}")
     private String configuredFileEncryptionKey;
 
+    /** Outgoing master key, set only while a rotation is in progress. */
+    @Value("${stirling.security.fileEncryptionKeyPrevious:}")
+    private String previousFileEncryptionKey;
+
+    /**
+     * Admin-bumped on master rotation; rows below this version get re-wrapped by /master/rotate.
+     */
+    @Value("${stirling.security.fileEncryptionKeyVersion:1}")
+    private int fileEncryptionKeyVersion;
+
     @Value("${cluster.enabled:false}")
     private boolean clusterEnabled;
 
-    @Bean(destroyMethod = "close")
-    public StorageProvider storageProvider() {
-        return withEncryption(innerStorageProvider());
-    }
-
     /**
-     * Wraps the backend with the encryption-at-rest decorator. The write side is gated on the
-     * config flag (plus Pro/Enterprise licence); the decrypt side activates whenever encryption
-     * keys exist, so switching the flag off — or a lapsed licence — never makes previously
-     * encrypted files unreadable.
+     * Builds the (conditionally active) encryption machinery once, shared by the storage decorator
+     * and the admin API so kill-switch cache invalidation hits the caches the decorator reads. The
+     * write side is gated on the config flag (plus Pro/Enterprise licence); the decrypt side
+     * activates whenever encryption keys exist, so switching the flag off — or a lapsed licence —
+     * never makes previously encrypted files unreadable.
      */
-    private StorageProvider withEncryption(StorageProvider inner) {
+    @Bean
+    public StorageEncryptionState storageEncryptionState() {
         boolean writeEnabled = applicationProperties.getStorage().getEncryption().isEnabled();
         boolean hasEncryptedContent = fileEncryptionKeyRepository.count() > 0;
         if (!writeEnabled && !hasEncryptedContent) {
-            return inner;
+            return StorageEncryptionState.INACTIVE;
         }
         if (writeEnabled) {
             licenseKeyChecker.requireProOrEnterprise("storage.encryption");
         }
         FileEncryptionMasterKey masterKey =
-                new FileEncryptionMasterKey(configuredFileEncryptionKey, clusterEnabled);
+                new FileEncryptionMasterKey(
+                        configuredFileEncryptionKey,
+                        previousFileEncryptionKey,
+                        fileEncryptionKeyVersion,
+                        clusterEnabled);
+        StorageEncryptionAuditListener listener =
+                new AuditingStorageEncryptionListener(
+                        auditService,
+                        applicationProperties.getStorage().getEncryption().isAuditReads());
         FileEncryptionKeyService keyService =
-                new FileEncryptionKeyService(fileEncryptionKeyRepository, masterKey);
+                new FileEncryptionKeyService(fileEncryptionKeyRepository, masterKey, listener);
         // Wrong key must fail startup, not silently start a second key hierarchy.
         keyService.verifyMasterKey();
         log.info(
                 "Storage encryption at rest active (writes {})",
                 writeEnabled ? "encrypted" : "plaintext; decrypt-only mode");
-        return new EncryptingStorageProvider(inner, keyService, writeEnabled);
+        return new StorageEncryptionState(writeEnabled, keyService, listener);
+    }
+
+    @Bean(destroyMethod = "close")
+    public StorageProvider storageProvider(StorageEncryptionState encryptionState) {
+        StorageProvider inner = innerStorageProvider();
+        if (!encryptionState.isActive()) {
+            return inner;
+        }
+        return new EncryptingStorageProvider(
+                inner,
+                encryptionState.keyService().orElseThrow(),
+                encryptionState.isWriteEnabled(),
+                encryptionState.auditListener());
     }
 
     private StorageProvider innerStorageProvider() {
