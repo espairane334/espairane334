@@ -6173,6 +6173,7 @@ successMessage = "Your license has been successfully activated. You can now clos
 outputsUnavailable = "Policy outputs are no longer available to download."
 partialOutputsUnavailable = "Some policy outputs are no longer available to download."
 runNotFound = "The enforcement run could no longer be found."
+serverUnreachable = "Lost contact with the server while the run was in flight."
 timedOut = "Enforcement timed out before the run could finish."
 
 [policies.enforcement]
@@ -6208,6 +6209,9 @@ ssn = "Social Security numbers"
 
 [policy]
 badgeEnforcing = "{{name}} enforcing..."
+badgeFailed = "{{name}} policy failed on this file — needs review"
+badgeFailedAction = "{{name}} policy failed — click to review"
+badgeIgnored = "{{name}} policy failed but was reviewed and ignored"
 badgeRan = "{{name}} policy ran on this file"
 blockingAction = "{{action}} blocked while enforcing policy, please wait..."
 dismiss = "Dismiss overlay"
@@ -9457,6 +9461,28 @@ title = "High Contrast"
 text = "Completely invert all colors in the PDF, creating a negative-like effect. Useful for creating dark mode versions of documents or reducing eye strain in low-light conditions."
 title = "Invert All Colors"
 
+[reviewTool.gate]
+bodyMany = "One or more of the selected documents needs review before you can {{action}} them."
+bodyOne = "This document needs review before you can {{action}} it."
+continueAnyway = "{{action}} anyway"
+reviewNow = "Review now"
+title = "Review required"
+
+[reviewTool.gate.verb]
+download = "download"
+print = "print"
+save = "save"
+share = "share"
+
+[reviewTool.trail]
+enforcementRun = "Enforcement run"
+stepFailed = "failed"
+
+[reviewTool.trail.source]
+pipeline = "Pipeline"
+policy = "Policy"
+tool = "Tool"
+
 [rotate]
 rotateLeft = "Rotate Counterclockwise"
 rotateRight = "Rotate Clockwise"
@@ -11212,6 +11238,22 @@ textStats = "{{lines}} lines · {{size}}"
 [viewer.redaction]
 removeMark = "Remove this mark"
 
+[viewer.review]
+approved = "Ignored & marked approved"
+close = "Close review panel"
+delete = "Delete"
+deleteBody = "This permanently removes the file from your workspace. This can't be undone."
+deleteConfirm = "Delete file"
+deleteTitle = "Delete this file?"
+history = "Processing history"
+historyEmpty = "No policy has run on this document yet — there is no processing history to review."
+ignore = "Ignore"
+noDocument = "No document open."
+noIssues = "No outstanding issues on this document."
+subtitle = "Check everything that ran on this document, then approve or delete it."
+title = "Review"
+undo = "Undo"
+
 [viewer.search]
 clear = "Clear search"
 close = "Close search"
@@ -11578,6 +11620,7 @@ readAloud = "Read Aloud"
 readAloudLanguage = "Language"
 readAloudSpeed = "Speed"
 redact = "Redact"
+review = "Needs review"
 rotateLeft = "Rotate Left"
 rotateRight = "Rotate Right"
 ruler = "Ruler / Measure"

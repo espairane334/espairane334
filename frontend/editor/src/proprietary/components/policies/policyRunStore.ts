@@ -45,6 +45,9 @@ export interface PolicyRunRecord {
   /** Set while an auto-retry is pending after a transient (queue-full) rejection, so the activity
    *  feed shows a soft "busy" row instead of a hard failure during the backoff window. */
   retrying?: boolean;
+  /** Signed off in the review area: an acknowledged failure stops flagging its
+   *  file (badge + export gate clear) but stays in history. Persisted. */
+  acknowledged?: boolean;
   /** Epoch ms when the run was dispatched. */
   startedAt: number;
 }
@@ -128,6 +131,7 @@ function read(): RunState {
               importedFileIds: Array.isArray(r.importedFileIds)
                 ? r.importedFileIds
                 : [],
+              acknowledged: r.acknowledged === true,
               // Records predating per-run targets all executed on SaaS.
               target: r.target === "local" ? "local" : "saas",
             }))
@@ -269,6 +273,27 @@ export function getRun(runId: string): PolicyRunRecord | undefined {
 export function removeRun(runId: string) {
   if (!state.runs.some((r) => r.runId === runId)) return;
   state = { ...state, runs: state.runs.filter((r) => r.runId !== runId) };
+  emit();
+}
+
+/**
+ * Drop every trace of a file: its runs (as input or output) and its dispatch
+ * keys. For a file deleted from storage, whose runs would otherwise keep it in
+ * the review queue and badge maps forever, pointing at bytes that are gone.
+ */
+export function forgetFile(fileId: string) {
+  const runs = state.runs.filter(
+    (r) => r.fileId !== fileId && !(r.outputFileIds ?? []).includes(fileId),
+  );
+  const suffix = `:${fileId}`;
+  const dispatched = state.dispatched.filter((key) => !key.endsWith(suffix));
+  if (
+    runs.length === state.runs.length &&
+    dispatched.length === state.dispatched.length
+  ) {
+    return;
+  }
+  state = { ...state, runs, dispatched };
   emit();
 }
 
