@@ -20,14 +20,20 @@ import stirling.software.common.model.enumeration.TeamRole;
 import stirling.software.proprietary.model.TeamMembership;
 import stirling.software.proprietary.security.repository.TeamMembershipRepository;
 import stirling.software.saas.procurement.config.ProcurementConfigurationProperties;
+import stirling.software.saas.procurement.legal.AgreementAssembler;
+import stirling.software.saas.procurement.legal.AgreementPdfRenderer;
+import stirling.software.saas.procurement.legal.AgreementSigning;
+import stirling.software.saas.procurement.legal.AssembledAgreement;
 import stirling.software.saas.procurement.license.EnterpriseLicenseService;
 import stirling.software.saas.procurement.license.LicenseEntitlements;
+import stirling.software.saas.procurement.model.ProcurementAgreementSignature;
 import stirling.software.saas.procurement.model.ProcurementDeal;
 import stirling.software.saas.procurement.model.ProcurementQuote;
 import stirling.software.saas.procurement.model.QuoteDetails;
 import stirling.software.saas.procurement.pricing.ProcurementPricingService;
 import stirling.software.saas.procurement.pricing.QuoteBreakdown;
 import stirling.software.saas.procurement.pricing.QuoteConfig;
+import stirling.software.saas.procurement.repository.ProcurementAgreementSignatureRepository;
 import stirling.software.saas.procurement.repository.ProcurementDealRepository;
 import stirling.software.saas.procurement.repository.ProcurementQuoteRepository;
 
@@ -52,6 +58,9 @@ public class ProcurementService {
     private final EnterpriseLicenseService licenses;
     private final ProcurementConfigurationProperties config;
     private final TeamMembershipRepository memberRepo;
+    private final AgreementAssembler agreementAssembler;
+    private final AgreementPdfRenderer agreementPdfRenderer;
+    private final ProcurementAgreementSignatureRepository signatureRepo;
 
     public ProcurementService(
             ProcurementDealRepository dealRepo,
@@ -59,13 +68,19 @@ public class ProcurementService {
             ProcurementPricingService pricing,
             EnterpriseLicenseService licenses,
             ProcurementConfigurationProperties config,
-            TeamMembershipRepository memberRepo) {
+            TeamMembershipRepository memberRepo,
+            AgreementAssembler agreementAssembler,
+            AgreementPdfRenderer agreementPdfRenderer,
+            ProcurementAgreementSignatureRepository signatureRepo) {
         this.dealRepo = dealRepo;
         this.quoteRepo = quoteRepo;
         this.pricing = pricing;
         this.licenses = licenses;
         this.config = config;
         this.memberRepo = memberRepo;
+        this.agreementAssembler = agreementAssembler;
+        this.agreementPdfRenderer = agreementPdfRenderer;
+        this.signatureRepo = signatureRepo;
     }
 
     /**
@@ -239,6 +254,146 @@ public class ProcurementService {
         deal = dealRepo.save(deal);
         log.info("[procurement] agreement stage team={} deal={}", teamId, deal.getDealId());
         return deal;
+    }
+
+    /** The quote a team is currently transacting on: its accepted quote, else the most recent. */
+    @Transactional(readOnly = true)
+    public Optional<ProcurementQuote> currentQuote(Long teamId) {
+        return dealRepo.findByTeamId(teamId)
+                .flatMap(
+                        deal -> {
+                            if (deal.getAcceptedQuoteId() != null) {
+                                Optional<ProcurementQuote> accepted =
+                                        quoteRepo.findById(deal.getAcceptedQuoteId());
+                                if (accepted.isPresent()) return accepted;
+                            }
+                            return quoteRepo
+                                    .findByDealIdOrderByCreatedAtDesc(deal.getDealId())
+                                    .stream()
+                                    .findFirst();
+                        });
+    }
+
+    /**
+     * The filled enterprise agreement for a team's current quote, rendered for review (unsigned).
+     */
+    @Transactional(readOnly = true)
+    public Optional<AssembledAgreement> agreementDocument(Long teamId) {
+        return currentQuote(teamId).map(q -> agreementAssembler.assemble(q, null));
+    }
+
+    /**
+     * The current (unsigned) agreement rendered to PDF, for download at the sign step. Empty when
+     * there's no quote yet or the render runtime is unavailable. The signed PDF (with the signature
+     * block filled) is a separate artifact recorded at signing (see {@link #latestSignature}).
+     */
+    @Transactional(readOnly = true)
+    public Optional<byte[]> agreementDocumentPdf(Long teamId) {
+        return currentQuote(teamId)
+                .map(q -> agreementAssembler.assemble(q, null))
+                .map(a -> agreementPdfRenderer.tryRender(a.markdown()));
+    }
+
+    /**
+     * Record a signed enterprise agreement: assemble the final document, hash it, render + store
+     * the PDF (best-effort), and persist an immutable signature pinned to the exact document
+     * version. Does not itself accept the quote into a subscription — the caller proceeds to accept
+     * as before.
+     */
+    @Transactional
+    public ProcurementAgreementSignature signAgreement(
+            Long teamId, AgreementSigning signing, String signerIp) {
+        ProcurementDeal deal =
+                dealRepo.findByTeamId(teamId)
+                        .orElseThrow(() -> new IllegalStateException("No deal for team " + teamId));
+        ProcurementQuote quote =
+                currentQuote(teamId)
+                        .orElseThrow(
+                                () ->
+                                        new IllegalStateException(
+                                                "No quote to sign for team " + teamId));
+
+        AssembledAgreement assembled = agreementAssembler.assemble(quote, signing);
+
+        ProcurementAgreementSignature sig = new ProcurementAgreementSignature();
+        sig.setDealId(deal.getDealId());
+        sig.setQuoteId(quote.getQuoteId());
+        sig.setDocumentId(assembled.docId());
+        sig.setDocumentVersion(assembled.version());
+        sig.setDocumentLabel(assembled.versionLabel());
+        sig.setContentHash(sha256(assembled.markdown()));
+        sig.setVariablesJson(assembled.variablesJson());
+        sig.setCustomerLegalName(signing.customerLegalName());
+        sig.setSignatoryName(signing.signatoryName());
+        sig.setSignatoryTitle(signing.signatoryTitle());
+        sig.setAuthorityConfirmed(signing.authorityConfirmed());
+        sig.setSignerIp(signerIp);
+        sig.setPdf(agreementPdfRenderer.tryRender(assembled.markdown()));
+        sig = signatureRepo.save(sig);
+        log.info(
+                "[procurement] agreement signed team={} quote={} doc={} pdf={}",
+                teamId,
+                quote.getQuoteId(),
+                assembled.versionLabel(),
+                sig.getPdf() != null);
+        return sig;
+    }
+
+    /** The latest recorded signature for a team's deal, if any (for the signed-PDF download). */
+    @Transactional(readOnly = true)
+    public Optional<ProcurementAgreementSignature> latestSignature(Long teamId) {
+        return dealRepo.findByTeamId(teamId)
+                .flatMap(
+                        deal ->
+                                signatureRepo.findFirstByDealIdOrderBySignedAtDesc(
+                                        deal.getDealId()));
+    }
+
+    /**
+     * The version label of the deal's latest signed agreement that has a downloadable PDF, if any.
+     * Used to surface the "download signed agreement" action only when a file actually exists (the
+     * snapshot polls this, so it deliberately avoids loading the PDF bytes).
+     */
+    @Transactional(readOnly = true)
+    public Optional<String> signedAgreementLabel(Long dealId) {
+        return signatureRepo.findSignedLabels(dealId).stream().findFirst();
+    }
+
+    /**
+     * The signed agreement as a PDF for download: the artifact stored at signing, or — if the
+     * render runtime was unavailable then — re-rendered now from the signature's details. Empty
+     * when the team has no signature or the render runtime is still unavailable.
+     */
+    @Transactional(readOnly = true)
+    public Optional<byte[]> signedAgreementPdf(Long teamId) {
+        return latestSignature(teamId)
+                .flatMap(
+                        sig -> {
+                            if (sig.getPdf() != null) return Optional.of(sig.getPdf());
+                            return quoteRepo
+                                    .findById(sig.getQuoteId())
+                                    .map(
+                                            q ->
+                                                    agreementAssembler.assemble(
+                                                            q,
+                                                            new AgreementSigning(
+                                                                    sig.getCustomerLegalName(),
+                                                                    sig.getSignatoryName(),
+                                                                    sig.getSignatoryTitle(),
+                                                                    sig.isAuthorityConfirmed())))
+                                    .map(a -> agreementPdfRenderer.tryRender(a.markdown()));
+                        });
+    }
+
+    private static String sha256(String s) {
+        try {
+            byte[] digest =
+                    java.security.MessageDigest.getInstance("SHA-256")
+                            .digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(digest);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
     }
 
     /**

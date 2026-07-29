@@ -22,6 +22,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import io.swagger.v3.oas.annotations.Hidden;
 
+import jakarta.servlet.http.HttpServletRequest;
+
 import lombok.extern.slf4j.Slf4j;
 
 import stirling.software.common.model.enumeration.TeamRole;
@@ -30,6 +32,8 @@ import stirling.software.proprietary.security.database.repository.UserRepository
 import stirling.software.proprietary.security.model.User;
 import stirling.software.proprietary.security.repository.TeamMembershipRepository;
 import stirling.software.saas.procurement.config.ProcurementConfigurationProperties;
+import stirling.software.saas.procurement.legal.AgreementSigning;
+import stirling.software.saas.procurement.model.ProcurementAgreementSignature;
 import stirling.software.saas.procurement.model.ProcurementDeal;
 import stirling.software.saas.procurement.model.ProcurementQuote;
 import stirling.software.saas.procurement.model.QuoteDetails;
@@ -190,7 +194,28 @@ public class ProcurementController {
             int trialExtensionsUsed,
             boolean licensed,
             String licenseKey,
+            // Version label of the signed agreement PDF available for download, else null.
+            String agreementSignedVersion,
             QuoteResponse latestQuote) {}
+
+    /** The filled agreement for review: registry metadata + the rendered markdown body. */
+    public record AgreementDocumentResponse(
+            String docId,
+            String version,
+            String versionLabel,
+            String displayName,
+            String effectiveDate,
+            String status,
+            String markdown) {}
+
+    /** Buyer-supplied signing inputs from the agreement stage. */
+    public record SignAgreementRequest(
+            String customerLegalName,
+            String signatoryName,
+            String signatoryTitle,
+            boolean authorityConfirmed) {}
+
+    public record SignAgreementResponse(Long signatureId, String versionLabel, boolean pdfStored) {}
 
     // ---- endpoints ----------------------------------------------------------
 
@@ -213,7 +238,7 @@ public class ProcurementController {
     }
 
     private static final SnapshotResponse EMPTY_SNAPSHOT =
-            new SnapshotResponse(null, null, null, 0, null, null, 0, false, null, null);
+            new SnapshotResponse(null, null, null, 0, null, null, 0, false, null, null, null);
 
     /**
      * Download the offline / air-gapped licence file (.lic) for the team — available for an
@@ -294,6 +319,111 @@ public class ProcurementController {
     }
 
     /**
+     * The filled Stirling Enterprise Agreement (MSA + Order Form + DPA) for the team's current
+     * quote, as markdown, for the buyer to review before signing. 404 when there's no quote yet.
+     */
+    @GetMapping("/agreement/document")
+    @PreAuthorize("isAuthenticated()")
+    public ResponseEntity<AgreementDocumentResponse> agreementDocument(Authentication auth) {
+        Long teamId = requireLeader(auth);
+        if (teamId == null) return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+        return procurement
+                .agreementDocument(teamId)
+                .<ResponseEntity<AgreementDocumentResponse>>map(
+                        a ->
+                                ResponseEntity.ok(
+                                        new AgreementDocumentResponse(
+                                                a.docId(),
+                                                a.version(),
+                                                a.versionLabel(),
+                                                a.displayName(),
+                                                a.effectiveDate(),
+                                                a.status(),
+                                                a.markdown())))
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /**
+     * Record a signed agreement: capture the typed legal name / signatory / title / authority, pin
+     * the exact document version + content hash + variable snapshot, and store the rendered PDF
+     * (best-effort). The caller then proceeds to accept the quote as before.
+     */
+    @PostMapping("/agreement/sign")
+    @PreAuthorize("isAuthenticated()")
+    public ResponseEntity<SignAgreementResponse> signAgreement(
+            @RequestBody SignAgreementRequest request,
+            Authentication auth,
+            HttpServletRequest http) {
+        Long teamId = requireLeader(auth);
+        if (teamId == null) return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+        if (request == null
+                || request.signatoryName() == null
+                || request.signatoryName().isBlank()
+                || !request.authorityConfirmed()) {
+            return ResponseEntity.badRequest().build();
+        }
+        try {
+            ProcurementAgreementSignature sig =
+                    procurement.signAgreement(
+                            teamId,
+                            new AgreementSigning(
+                                    request.customerLegalName(),
+                                    request.signatoryName(),
+                                    request.signatoryTitle(),
+                                    request.authorityConfirmed()),
+                            clientIp(http));
+            return ResponseEntity.ok(
+                    new SignAgreementResponse(
+                            sig.getSignatureId(), sig.getDocumentLabel(), sig.getPdf() != null));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).build();
+        }
+    }
+
+    /** Download the stored signed-agreement PDF for the team. 404 if none was rendered/stored. */
+    @GetMapping("/agreement/signature/pdf")
+    @PreAuthorize("isAuthenticated()")
+    public ResponseEntity<byte[]> signaturePdf(Authentication auth) {
+        Long teamId = requireLeader(auth);
+        if (teamId == null) return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+        return procurement
+                .signedAgreementPdf(teamId)
+                .<ResponseEntity<byte[]>>map(
+                        pdf ->
+                                ResponseEntity.ok()
+                                        .header(
+                                                HttpHeaders.CONTENT_DISPOSITION,
+                                                "attachment;"
+                                                        + " filename=\"stirling-enterprise-agreement.pdf\"")
+                                        .contentType(MediaType.APPLICATION_PDF)
+                                        .body(pdf))
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /**
+     * Download the current (unsigned) agreement as a PDF — the document shown at the sign step. 404
+     * when there's no quote yet or the render runtime is unavailable.
+     */
+    @GetMapping("/agreement/document/pdf")
+    @PreAuthorize("isAuthenticated()")
+    public ResponseEntity<byte[]> agreementDocumentPdf(Authentication auth) {
+        Long teamId = requireLeader(auth);
+        if (teamId == null) return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+        return procurement
+                .agreementDocumentPdf(teamId)
+                .<ResponseEntity<byte[]>>map(
+                        pdf ->
+                                ResponseEntity.ok()
+                                        .header(
+                                                HttpHeaders.CONTENT_DISPOSITION,
+                                                "attachment;"
+                                                        + " filename=\"stirling-enterprise-agreement.pdf\"")
+                                        .contentType(MediaType.APPLICATION_PDF)
+                                        .body(pdf))
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /**
      * Provision on accept: upgrade the team's licence to the committed annual term, valid
      * immediately. Called server-side by the accept edge function (ROLE_ADMIN via X-API-Key) once
      * the subscription + invoice exist, so the buyer is licensed the moment they accept — the deal
@@ -360,6 +490,15 @@ public class ProcurementController {
                 .orElse(null);
     }
 
+    /** Best-effort client IP for the signature record: first X-Forwarded-For hop, else the peer. */
+    private static String clientIp(HttpServletRequest request) {
+        String forwarded = request.getHeader("X-Forwarded-For");
+        if (forwarded != null && !forwarded.isBlank()) {
+            return forwarded.split(",")[0].trim();
+        }
+        return request.getRemoteAddr();
+    }
+
     /**
      * Build the snapshot for a deal. {@code includeLicenseKey} is true only for the team leader; a
      * member sees {@code licensed} but not the key itself (see {@link #snapshot}). Mutation
@@ -381,6 +520,7 @@ public class ProcurementController {
                 deal.getTrialExtensionsUsed(),
                 deal.getLicenseRef() != null,
                 includeLicenseKey ? deal.getLicenseRef() : null,
+                procurement.signedAgreementLabel(deal.getDealId()).orElse(null),
                 latest);
     }
 
