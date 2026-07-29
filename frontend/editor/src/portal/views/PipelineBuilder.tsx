@@ -317,7 +317,7 @@ export function PipelineBuilder() {
   // An integration step with no operation or no account chosen would fail at run time with a raw
   // backend rejection, so block saving on it here where the fix is one click away.
   const unconfiguredStepLabels = steps
-    .filter((step) => !integrationStepConfigured(step))
+    .filter((step, i) => !integrationStepConfigured(step, i + 1))
     .map(stepLabel);
   const hasUnconfiguredSteps = unconfiguredStepLabels.length > 0;
 
@@ -790,9 +790,14 @@ export function PipelineBuilder() {
                           <span className="portal-builder__step-note">
                             {t("portal.pipelines.builder.chooseOperation")}
                           </span>
-                        ) : !integrationStepConfigured(step) ? (
+                        ) : !(step.params as Record<string, unknown>)
+                            .connectionId ? (
                           <span className="portal-builder__step-note">
                             {t("portal.pipelines.builder.chooseAccount")}
+                          </span>
+                        ) : !integrationStepConfigured(step, i + 1) ? (
+                          <span className="portal-builder__step-note">
+                            {t("portal.pipelines.builder.fixStepFields")}
                           </span>
                         ) : null
                       ) : stepRequiresUpload(step) ? (
@@ -877,6 +882,9 @@ export function PipelineBuilder() {
             {selectedStep ? (
               <PipelineStepSettings
                 step={selectedStep}
+                stepPosition={
+                  selectedIndex !== null ? selectedIndex + 1 : undefined
+                }
                 registry={allTools}
                 onChange={(params) =>
                   selectedIndex !== null &&
